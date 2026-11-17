@@ -1,0 +1,83 @@
+name: Sync upstream (move deleted to 已删除/)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git config
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # 设置pull默认策略，避免divergent报错
+          git config pull.rebase false
+
+      - name: Prepare upstream remote
+        run: |
+          if ! git remote | grep -q upstream; then
+            git remote add upstream https://github.com/Cec1c/ServerS5A3.git
+          fi
+          git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          COUNT=$(git rev-list --count HEAD..upstream/master)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "update=yes" >> $GITHUB_OUTPUT
+          else
+            echo "update=no" >> $GITHUB_OUTPUT
+            echo "✅ 上游无新提交，跳过同步"
+          fi
+
+      - name: Archive deleted files & sync
+        if: steps.check.outputs.update == 'yes'
+        run: |
+          DELETED_DIR="已删除"
+          # 获取上游对比当前本地，标记为D（删除）的文件
+          git diff --name-status HEAD upstream/master | awk '$1 == "D" {print $2}' > del_list.txt
+
+          # 归档删除文件
+          while IFS= read -r file; do
+            # 跳过本身就在已删除文件夹里的文件，防止循环
+            if [[ "$file" == "${DELETED_DIR}"/* ]]; then
+              continue
+            fi
+            # 文件必须存在于当前HEAD才归档，防止文件不存在报错
+            if git ls-tree -q HEAD "$file" >/dev/null 2>&1; then
+              target="${DELETED_DIR}/${file}"
+              mkdir -p "$(dirname "$target")"
+              git show "HEAD:${file}" > "$target"
+              git add "$target"
+              echo "归档：$file → $target"
+            fi
+          done < del_list.txt
+          rm -f del_list.txt
+
+          # 尝试合并上游
+          if git merge upstream/master; then
+            echo "✅ merge成功"
+          else
+            echo "❌ 分支分叉/存在冲突，停止同步，不推送"
+            exit 1
+          fi
+
+          # 提交归档文件
+          if git diff --cached --quiet; then
+            echo "ℹ️ 本次没有需要归档的删除文件"
+          else
+            git commit -m "auto sync: sync upstream, archive deleted files into 已删除/"
+            git push origin master
+          fi
